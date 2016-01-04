@@ -1,0 +1,219 @@
+require 'test/unit'
+
+require_relative '../simulation'
+
+# To make sure vim has tab delimited values use the following when creating an input:
+#    :%retab!
+#    :%substitute/ \+/\t/g
+
+class WorldTest < Test::Unit::TestCase
+  def setup
+    @sim = Simulation.new('configs/default.yml')
+    @sim.sched_policy = Constants::SchedulingPolicies::REPLAY
+  end
+
+  def test_negative_on_waiting
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/negative_on_waiting.csv'
+      @sim.run
+    end
+  end
+
+  def test_cluster_change
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/cluster_change.csv'
+      @sim.run
+    end
+  end
+
+  def test_status_going_back
+    # Should no longer through an error cause RM can resubmit a job that doesn't appear 
+	  # for a min and so it is considered finished
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/backward_state_change.csv'
+      @sim.run
+    end
+  end
+
+  def test_status_going_back_with_gaps
+    # Should no longer through an error cause RM can resubmit a job that doesn't appear 
+	  # for a min and so it is considered finished
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/backward_state_change_with_gap.csv'
+      @sim.run
+    end
+  end
+
+  def test_job_done_on_host_only
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/job_done_on_host_only.csv'
+      @sim.run
+    end
+  end
+
+  def test_counters_free_hosts_multiple_expired_requested
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/free_hosts.csv'
+      @sim.run
+
+      set_expected_count_values([4, 0, 4, 0, 1, 1, 1, 0])
+      get_sim_count_values('sc1', 'yellowhammer')
+      assert_count_values
+    end
+  end
+
+  def test_counters_free_hosts_requested
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/free_hosts2.csv'
+      @sim.run
+
+      set_expected_count_values([1, 0, 1, 0, 1, 1, 1, 0])
+      get_sim_count_values('sc1', 'yellowhammer')
+      assert_count_values
+    end
+  end
+
+  def test_counters_free_hosts_running_expired_requested
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/free_hosts3.csv'
+      @sim.run
+
+      set_expected_count_values([2, 0, 2, 0, 1, 1, 1, 0])
+      get_sim_count_values('sc1', 'yellowhammer')
+      assert_count_values
+    end
+  end
+
+  def test_counters_free_hosts_multiple_expired_other_requested
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/free_hosts4.csv'
+      @sim.run
+
+      set_expected_count_values([5, 0, 4, 0, 0, 0, 0, 0])
+      get_sim_count_values('sc1', 'yellowhammer')
+      assert_count_values
+    end
+  end
+
+  def test_cluster_is_full
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/full_clusters.csv'
+      @sim.run
+
+      assert(@sim.sim_state.world.clusters['yellowhammer'].full == true, \
+	     'Cluster yellowhammer is full!')
+      waiting_tasks_found = @sim.sim_state.world.clusters['yellowhammer'].waiting_tasks_count
+      assert(waiting_tasks_found == 2, \
+	     "Expecting: 2 - Found: #{waiting_tasks_found}  for cluster yellowhammer")
+
+      assert(@sim.sim_state.world.clusters['test5'].full == true, \
+	     'Cluster test5 is full!')
+      waiting_tasks_found = @sim.sim_state.world.clusters['test5'].waiting_tasks_count
+      assert(waiting_tasks_found == 1, "Expecting: 1 - Found: #{waiting_tasks_found} \
+	     for cluster test5")
+
+      assert(@sim.sim_state.world.clusters['test6'].full == false, \
+	     'Cluster is not full! Utilizes all its hosts but has no waiting tasks')
+      waiting_tasks_found = @sim.sim_state.world.clusters['test6'].waiting_tasks_count
+      assert(waiting_tasks_found == 0, "Expecting: 0 - Found: #{waiting_tasks_found}  \
+	     for cluster test6")
+
+      assert(@sim.sim_state.world.clusters['test'].full == false, \
+	     'Cluster test is not full! It has no waiting tasks!')
+      assert(@sim.sim_state.world.clusters['test2'].full == true, \
+	     'Cluster test2 is full!')
+      waiting_tasks_found = @sim.sim_state.world.clusters['test2'].waiting_tasks_count
+      assert(waiting_tasks_found == 1, "Expecting: 1 - Found: #{waiting_tasks_found} \
+	     for cluster test2")
+
+      assert(@sim.sim_state.world.clusters['test3'].full == true, 'Cluster test3 is full!')
+
+      assert(@sim.sim_state.world.clusters['test4'].full == true, \
+	     'Cluster test4 is full because it has waiting tasks!')
+      waiting_tasks_found = @sim.sim_state.world.clusters['test4'].waiting_tasks_count
+      assert(waiting_tasks_found == 1, \
+	     "Expecting: 1 - Found: #{waiting_tasks_found} for cluster test4")
+    end
+  end
+
+  def test_cluster_is_full2
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/full_clusters2.csv'
+      @sim.run
+      
+      assert(@sim.sim_state.world.clusters['visiblemeasures'].full == false, \
+	     'Cluster visiblemeasures is not full!')
+    end
+  end
+
+  def test_cluster_is_full3
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/full_clusters3.csv'
+      @sim.run
+
+      assert(@sim.sim_state.world.clusters['yellowhammer'].full == false, \
+	     'Cluster yellowhammer is not full!')
+    end
+  end
+
+  def test_cluster_is_full4
+    assert_nothing_raised do
+      @sim.input_file = 'inputs/full_clusters4.csv'
+      @sim.run
+
+      assert(@sim.sim_state.world.clusters['yellowhammer'].full == false, \
+	     'Cluster yellowhammer is not full!')
+    end
+  end
+
+  private
+
+  def set_expected_count_values(exp_counts)
+    @exp_colloc_free_hosts_count = exp_counts[0]
+    @exp_colloc_busy_hosts_count = exp_counts[1]
+    @exp_cluster_free_hosts_count = exp_counts[2]
+    @exp_cluster_busy_hosts_count = exp_counts[3]
+    @exp_cluster_waiting_jobs = exp_counts[4]
+    @exp_cluster_active_jobs = exp_counts[5]
+    @exp_cluster_waiting_tasks = exp_counts[6]
+    @exp_cluster_active_tasks = exp_counts[7]
+  end
+
+  def get_sim_count_values(colloc_name, cluster_name)
+    @found_colloc_free_hosts_count = @sim.sim_state.world.collocs[colloc_name].free_hosts_count
+    @found_colloc_busy_hosts_count = @sim.sim_state.world.collocs[colloc_name].busy_hosts_count
+    @found_cluster_free_hosts_count = @sim.sim_state.world.clusters[cluster_name].free_hosts_count
+    @found_cluster_busy_hosts_count = @sim.sim_state.world.clusters[cluster_name].busy_hosts_count
+    @found_cluster_waiting_jobs = @sim.sim_state.world.clusters[cluster_name].waiting_jobs_count
+    @found_cluster_active_jobs = @sim.sim_state.world.clusters[cluster_name].active_jobs_count
+    @found_cluster_waiting_tasks = @sim.sim_state.world.clusters[cluster_name].waiting_tasks_count
+    @found_cluster_active_tasks = @sim.sim_state.world.clusters[cluster_name].active_tasks_count
+  end
+
+  def assert_count_values
+    assert(@found_colloc_free_hosts_count == @exp_colloc_free_hosts_count, \
+	   "colloc free hosts count incorrect! Expecting: #{@exp_colloc_free_hosts_count} \
+	   Found: #{@found_colloc_free_hosts_count}")
+    assert(@found_colloc_busy_hosts_count == @exp_colloc_busy_hosts_count, \
+	   "colloc busy hosts count incorrect! Expecting: #{@exp_colloc_busy_hosts_count} \
+	   Found: #{@found_colloc_busy_hosts_count}")
+    assert(@found_cluster_free_hosts_count == @exp_cluster_free_hosts_count, \
+	   "cluster free hosts count incorrect! Expecting: #{@exp_colloc_free_hosts_count} \
+	   Found: #{@found_colloc_free_hosts_count}")
+    assert(@found_cluster_busy_hosts_count == @exp_cluster_busy_hosts_count, \
+	   "cluster busy hosts count incorrect! Expecting: #{@exp_colloc_busy_hosts_count} \
+	   Found: #{@found_colloc_busy_hosts_count}")
+    assert(@found_cluster_waiting_jobs == @exp_cluster_waiting_jobs, \
+	   "cluster waiting jobs incorrect! Expecting: #{@exp_cluster_waiting_jobs} \
+	   Found: #{@found_cluster_waiting_jobs}")
+    assert(@found_cluster_active_jobs == @exp_cluster_active_jobs, \
+	   "cluster active jobs incorrect! Expecting: #{@exp_cluster_active_jobs} \
+	   Found: #{@found_cluster_active_jobs}")
+    assert(@found_cluster_waiting_tasks == @exp_cluster_waiting_tasks, \
+	   "cluster waiting tasks incorrect! Expecting: #{@exp_cluster_waiting_tasks} \
+	   Found: #{@found_cluster_waiting_tasks}")
+    assert(@found_cluster_active_tasks == @exp_cluster_active_tasks, \
+	   "cluster active tasks incorrect! Expecting: #{@exp_cluster_active_tasks} \
+	   Found: #{@found_cluster_active_tasks}")
+  end
+end

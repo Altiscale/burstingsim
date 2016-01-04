@@ -1,0 +1,27 @@
+input_file: 'test_inputs/sample_input.csv'
+date_filter_on: false #For testing it should always be false as tests depend on input files
+start_date: '2015-01-01'
+end_date: '2015-05-31'
+ignore_clusters: "iheartradio"
+consider_clusters: ""
+
+#Not used
+speed: 24
+sim_granulatiry: 1
+training_window: 0
+# ----------------- #
+
+
+inventory_hosts_count: 10 #Number of unassigned inventory hosts per colloc
+min_inventory_hosts: 3 #The minimum amount of hosts that should always be available on inventory
+
+#Scheduler specific configuration
+eviction_delay: 2 #Time needed in minutes to evict a host from a cluster to inventory
+provision_delay: 2 #Time needed in minutes to provision a host from inventory to a cluster
+scheduling_granularity: 60 #Time interval in minutes between scheduling decisions
+policy: 'SIMPLE' # REPLAY - SIMPLE
+allow_provisions: true
+allow_evictions: true
+
+#Output
+verbosity: v # v, vv, vvv to increase verbosity

@@ -1,0 +1,2036 @@
+require 'set'
+require 'logger'
+require 'csv'
+require 'observer'
+
+require_relative 'events/input_log_event'
+require_relative 'state_updater'
+require_relative 'modules/constants'
+require_relative 'lru'
+require_relative 'modules/errors'
+
+# Every resource (cluster, host, colloc or anything else added in the future)
+# is getting registered with the world
+# at the time of the creation on its constructor. 
+# World is responsible to register the new resource with all the related 
+# entities on its "register" method.
+# Similarly a job will register with the cluster and the cluster is 
+# responsible to register the job with the host.
+# Jobs are not directly accessed through the world as they cannot exist 
+# without a cluster.
+# methods with _signal postfix determine changes to internal state required 
+# by an external event that the object itself is not aware. 
+# For example finished jobs are determined by world and then signals are 
+# send to clusters, hosts and jobs
+class World
+  include Observable
+  
+  attr_accessor :clusters,
+                :hosts,
+                :collocs,
+                # <(cluster_name, host_name, job_id), Task<Status, Count>>
+                :tasks_map,
+                #:hosts_cluster_map, #Mappings of hosts to clusters
+                :last_seen_jobs_on_host,
+                :last_seen_jobs_on_cluster,
+                :running_tasks_count,
+                :waiting_tasks_count,
+                :last_processed_timestamp,
+                :time_created,
+                :ticks,
+                :last_tick_change,
+                :granularity,
+                :inventory_hosts_count,
+                :observers
+  def initialize(conf)
+    configure(conf)
+    @clusters = Hash.new(0)
+    @collocs = Hash.new(0)
+    @hosts = Hash.new(0)
+    @tasks_map = Hash.new(0)
+    @ticks = 0
+    @last_tick_change = 0
+    @granularity = Constants::Numeric::GRANULARITY
+    # For example ACQUIRED status for a particular job running on a host
+    @last_seen_task_statuses_of_job_on_host = Lru.new(-1, @granularity)
+
+    # Keep unlimited job keys that are not older than granularity seconds
+    # than the current timestamp
+    @last_seen_jobs_on_host = Lru.new(-1, @granularity)
+    @last_seen_jobs_on_cluster = Lru.new(-1, @granularity) 
+    @observers = []
+    @processed_clusters = []
+    @logger = Logger.new(STDOUT)
+    @logger.level = Logger::INFO
+  end
+
+  def print_summary
+    puts '------------------ Summary -------------------'
+    puts "Clusters count: #{@clusters.size}"
+    puts "Hosts count: #{@hosts.size}"
+    puts "Collocs: #{get_collocs_names}"
+    puts "Clusters: #{get_clusters_names}"
+
+    @collocs.each { |_name, colloc| colloc.print_summary }
+    @clusters.each { |_name, cluster| cluster.print_summary }
+  end
+
+  def print_all
+    puts '------------- Collocs ------------------------'
+    @collocs.each { |_name, colloc| colloc.print_all }
+    puts "\n"
+
+    puts '------------- Clusters -----------------------'
+    @clusters.each do |_name, cluster|
+      # cluster.print_all
+      # cluster.print_summary
+      puts "\n"
+      cluster.print(true, false, false, false)
+    end
+  end
+
+  def update_stats(timestamp)
+    @collocs.each_value { |c| c.update_stats(timestamp) }
+  end
+
+  def print_stats
+    @collocs.each do |name, c|
+      puts "#{name}:"
+      c.print_stats
+    end
+  end
+
+  def timestamp_changed_signal(timestamp)
+    timestamp_changed(timestamp)
+    if timestamp > @creation_time
+      now = Time.now
+      if (@ticks % @granularity == 0)
+        @logger.info "Hours processed: #{@ticks / @granularity} - \
+  Processing time: #{now - @last_tick_change}  - \
+  Current timestamp: #{timestamp}"
+        print_stats
+      end
+      @ticks += 1
+      @last_tick_change = now
+      # Send when all events of the timestamp are processed
+      send_finished_signals(timestamp)
+      send_timestamp_changed_signals(timestamp)
+      # Get values only when the timestamp changes to make sure all events 
+      # of the same timestamp are processed
+      # print_offer_and_demand
+      update_stats(timestamp)
+       end
+  end
+
+  def update(event)
+
+    if event.is_a?(ControlEvent) && event.message == Constants::ControlMessages::SIM_IS_OVER
+      puts "Received #{event.message} event!"
+      return
+    elsif (event.is_a?(SchedulingEvent))
+      process_scheduling_event(event)
+      return #Do nothing at the moment
+    end
+    # OPTIMIZE: Instead of treating finished jobs differently I could create 
+    # finished events and run update methods on all affected entities
+
+    # Sending finished signals should preceed the scheduling decisions 
+    # so it cannot be an observer to the world_state like the scheduler is.
+
+    colloc_name = event.host_name.split('.')[1]
+    # Create objects if they don't already exist in the world
+    colloc, cluster, host, job = get_affected_resources(
+      colloc_name, event.cluster_name, event.host_name, 
+      event.job_id, event.task_status)
+
+    # Tracking the affected resources for the whole timestamp  
+    @processed_clusters << cluster
+    @processed_hosts << host
+    @processed_jobs << job
+      
+    @logger.debug 'Updating state with event:'
+    event.print if @logger.debug?
+
+    # Update tasks_map and get diff from previous state
+    cluster_job_key = ClusterJobKey.new(event.cluster_name, event.job_id)
+    host_job_key = HostJobKey.new(event.cluster_name, event.host_name, event.job_id)
+    # Have to track the statuses that appear on each minute, so they can be reseted to zero when 
+    # they don't appear for a minute. 
+    # There still will be 1min delay to update the status of a task that is going for example from 
+    # acquired to running state on the same minute. We don't have TASK IDs on the input - 
+    # so we cannot be sure about task status transitions.
+    host_job_status_key = HostJobStatusKey.new(event.cluster_name, event.host_name, 
+                 event.job_id, event.task_status) 
+
+    update_lru_cache(event.timestamp, host_job_status_key, host_job_key, cluster_job_key)
+
+    # Host changed! Make changes before updates happen
+    if host_changed_cluster?(event.host_name, event.cluster_name)
+      move_host_to_cluster(event.host_name, event.cluster_name) 
+    end
+
+    # The following updates should happen only after the "update_finished_jobs" is called, 
+    # as this will trigger external changes to object and then object have 
+    # to update their internal state to be consistent
+    # Getting the difference of tasks for the particular host and job based on this event 
+    # and compared to the previous count.
+    # This works only for the statuses that still have at least one task running. 
+    # The rest are treated with signals.
+    task_diff = set_tasks_count(host_job_key, event.task_status, event.task_count) 
+    update_rest_of_world(event, cluster, host, job, task_diff)
+  end
+
+  def process_scheduling_event(scheduling_event)
+    scheduling_event.print
+    puts "Processing event"
+    if scheduling_event.is_a?(EvictionEvent)
+      process_eviction_event(scheduling_event)
+    elsif scheduling_event.is_a?(ProvisionEvent)
+      process_provision_event(scheduling_event)
+    else
+      fail UnknownSchedulingEventTypeError, "Scheduling type #{scheduling_event.class} not supported!"
+    end
+  end
+  
+  def get_affected_resources(colloc_name, cluster_name, host_name, job_id, task_status)
+    colloc = (collocs.key? colloc_name) ? collocs[colloc_name] : Colloc.new(self, colloc_name)
+    cluster = (clusters.key? cluster_name) ? clusters[cluster_name] : Cluster.new(self, cluster_name, colloc)
+    if hosts.key? host_name
+      host = hosts[host_name]
+    else
+      host = Host.new(self, colloc, host_name)
+      host.configure(self, cluster, task_status) # Will be registered with a cluster here
+    end
+    job = (cluster.has_job(job_id)) ? cluster.get_job(job_id) : Job.new(cluster, job_id, cluster_name)
+
+    [colloc, cluster, host, job]
+  end
+
+  def register_cluster(cluster, colloc_name)
+    @clusters[cluster.name] = cluster
+    register_cluster_with_colloc(cluster, colloc_name)
+  end
+
+  def register_colloc(colloc)
+    @collocs[colloc.name] = colloc
+  end
+
+  def register_host(host, colloc_name)
+    # OPTIMIZE: Host didn't have access to cluster and colloc object at the time this method 
+    # was implemented. Consider making registration directly from host to cluster and colloc
+    @hosts[host.name] = host
+    # OPTIMIZE: Consider doing the registrations on host, cluster or colloc updates
+    register_host_with_colloc(host, colloc_name)
+  end
+
+  def update_host_registration(host, cluster_name)
+    register_host_with_cluster(host, cluster_name)
+  end
+
+  def get_full_clusters
+    @collocs.each_values do |col|
+      full_clusters.merge(col.full_clusters)
+    end
+    full_clusters
+  end
+
+  private
+
+  def configure(conf)
+    @inventory_hosts_count = conf['inventory_hosts_count'] 
+  end
+
+  def register_cluster_with_colloc(cluster, colloc_name)
+    @collocs[colloc_name].register_cluster(cluster)
+  end
+
+  def register_host_with_colloc(host, colloc_name)
+    @collocs[colloc_name].register_host(host)
+  end
+
+  def register_host_with_cluster(host, cluster_name)
+    @clusters[cluster_name].register_host(host)
+  end
+
+  def deregister_host_from_cluster(host_name, cluster_name)
+    @clusters[cluster_name].deregister_host(host_name)
+  end
+
+  def send_timestamp_changed_signals(timestamp)
+    return if @processed_clusters.nil? 
+    #TODO: Check order
+    #@processed_jobs.events_processed_signal(timestamp)
+    #@processed_hosts.events_processed_signal(timestamp)
+    send_timestamp_changed_to_processed_resource(timestamp, @processed_clusters)
+    #send_timestamp_changed_to_processed_resource(timestamp, @processed_hosts)
+    #send_timestamp_changed_to_processed_resource(timestamp, @processed_jobs)
+   
+    @processed_clusters = []
+    @processed_hosts = []
+    @processed_jobs = []
+  end
+  
+  def send_timestamp_changed_to_processed_resource(timestamp, resource)
+    return if resource.nil?
+    resource.each do |r|
+       r.events_processed_signal(timestamp)
+    end
+  end
+  
+  def send_finished_signals(timestamp)
+    # Dealing with Jobs and Task statuses that no longer appear on the updates. For example jobs 
+    # that are finished on a host or they have completed their execution on the cluster or a task 
+    # status that doesn't have any task to represent it on the current timestamp 
+    # (for example 0 tasks on acquired status)
+    #
+    # NOTE: With the current algorithm jobs are found when clock ticks 2 min after the last time 
+    # the job was seen running. For example if the last updated is on timestamp 1420099200 
+    # the job will be marked as finished on the first event with timestamp 1420099320
+    # , since at this point all event updates with timestamps 1420099260 are done!
+
+    not_existing_task_statuses_of_job_on_host = @last_seen_task_statuses_of_job_on_host.expire(timestamp)
+    # Process all jobs that haven't appear for more than granularity seconds on a host
+    finished_jobs_on_host = @last_seen_jobs_on_host.expire(timestamp) 
+    finished_jobs_on_cluster = @last_seen_jobs_on_cluster.expire(timestamp)
+
+    # Order of the following two is important! If task counters are updated first then job status 
+    # will be changed before cluster gets the job_finished_signal and so cluster job counters will 
+    # not be updated correctly
+    reset_task_statuses_count(not_existing_task_statuses_of_job_on_host)
+    update_finished_jobs(finished_jobs_on_cluster, finished_jobs_on_host)
+  end
+
+  def update_lru_cache(timestamp, host_job_status_key, host_job_key, cluster_job_key)
+    @last_seen_task_statuses_of_job_on_host[host_job_status_key] = timestamp
+    @last_seen_jobs_on_host[host_job_key] = timestamp
+    @last_seen_jobs_on_cluster[cluster_job_key] = timestamp
+  end
+
+  def host_changed_cluster?(host_name, event_cluster_name)
+    (@hosts[host_name].cluster_name != event_cluster_name) ? true : false
+  end
+
+  def move_host_to_cluster(host_name, new_cluster_name)
+    old_cluster_name = @hosts[host_name].cluster_name
+    deregister_host_from_cluster(host_name, old_cluster_name)
+    register_host_with_cluster(@hosts[host_name], new_cluster_name)
+    @logger.info "Cluster for host #{host_name} changed from: #{old_cluster_name} to: #{new_cluster_name}"
+   end
+
+  def update_rest_of_world(event, cluster, host, job, task_diff)
+    # Correct update depends on the order of updates. Job update should run first.
+
+    job.update(event, task_diff, cluster)
+    host.update(event, task_diff, cluster)
+    cluster.update(event, task_diff)
+    #No need to update colloc --> will be updated with signals every time host status is updated
+  rescue => e
+    @logger.error e.message
+    e.backtrace.each { |line| @logger.error line }
+    raise
+  end
+
+  def print_offer_and_demand
+    # *Used only to create a graph - not part of the code flaw
+    logger = Logger.new('offer_and_demand-7days.csv')
+    logger.level = Logger::INFO
+    if @collocs.key?('sc1')
+      offer = @collocs['sc1'].free_hosts_count
+      demand = @collocs['sc1'].full_clusters_count
+      all_clusters = @collocs['sc1'].clusters_count
+      jobs_waiting = waiting_jobs_of_colloc('sc1')
+      tasks_waiting = waiting_tasks_of_colloc('sc1')
+
+      logger.<< "#{offer},#{demand},#{all_clusters},#{jobs_waiting},#{tasks_waiting}\n"
+      # sanity_check_on_colloc("sc1")
+    end
+  end
+
+  def sanity_check_on_colloc(colloc_name)
+    @collocs[colloc_name].full_clusters.each_value do |cluster|
+      if cluster.free_hosts_count != 0 || (cluster.busy_hosts_count != cluster.hosts_count)
+        fail InconsistentStateError, "#{@last_processed_timestamp}: #{cluster_name} \
+  - #{cluster.free_hosts_count} - #{cluster.busy_hosts_count} - #{cluster.hosts_count}"
+      end
+    end
+  end
+
+  def waiting_jobs_of_colloc(colloc_name)
+    count = 0
+    @collocs[colloc_name].clusters.each do |cluster_name|
+      count += @clusters[cluster_name].waiting_jobs_count
+    end
+    count
+  end
+
+  def waiting_tasks_of_colloc(colloc_name)
+    count = 0
+    @collocs[colloc_name].clusters.each do |cluster_name|
+      count += @clusters[cluster_name].waiting_tasks_count
+    end
+    count
+  end
+
+  def timestamp_changed(timestamp)
+    if @last_processed_timestamp.nil?
+      @creation_time = timestamp - @granularity
+      @last_processed_timestamp = @creation_time
+    elsif (timestamp - @last_processed_timestamp) > @granularity
+      @last_processed_timestamp = timestamp - @granularity
+    end
+  end
+
+  def timestamp_changed?(timestamp)
+    if @last_processed_timestamp.nil?
+      @creation_time = timestamp - @granularity
+      @last_processed_timestamp = @creation_time
+    elsif (timestamp - @last_processed_timestamp) > @granularity
+      @last_processed_timestamp = timestamp - @granularity
+      return true
+    end
+    false
+  end
+
+  def process_eviction_event(scheduling_event)
+    puts "Eviction"
+  end
+  
+  def process_provision_event(scheduling_event)
+    puts "Provision"
+    
+    # Do this in appropriate order: Move from moving to free on colloc and register node with cluster
+    # Create "provisioned" hosts on cluster. This will be used to assign tasks on these free nodes
+    # Provisioned hosts can be on free or busy status
+    # Flag clusters that have provisioned hosts
+    
+    # When receiving an event with task in requested status
+    # Add memory capacity to a cluster
+    # If a flagged cluster
+      # Create running events and assign to "provisioned" hosts
+
+  end
+  
+  def get_collocs_names
+    @collocs.keys.join(', ')
+  end
+
+  def get_clusters_names
+    @clusters.keys.join(', ')
+  end
+
+  def get_tasks_map_with_key(job_host_key)
+    @tasks_map[job_host_key]
+  end
+
+  def get_hosts_from_cluster(cluster_name, status)
+    @clusters[cluster_name].get_hosts(status)
+  end
+
+  def get_hosts_from_colloc(colloc_name, status)
+    @collocs[colloc_name].get_hosts(status)
+  end
+
+  def deregister_cluster(cluster)
+    @clusters.delete(cluster.name)
+  end
+
+  def deregister_colloc(colloc)
+    @collocs.delete(colloc.name)
+  end
+
+  def deregister_host_from_world(host)
+    @hosts.delete[host.name]
+  end
+
+  def hosts_count
+    @hosts.size
+  end
+
+  def increase_running_tasks(count)
+    @running_tasks_count += count
+  end
+
+  def decrease_running_tasks(count)
+    @running_tasks_count -= count
+  end
+
+  def increase_waiting_tasks(count)
+    @waiting_tasks_count += count
+  end
+
+  def decrease_waiting_tasks(count)
+    @waiting_tasks_count -= count
+  end
+
+  def reset_task_statuses_count(not_existing_task_statuses_of_job_on_host)
+    return unless !not_existing_task_statuses_of_job_on_host.nil? && !not_existing_task_statuses_of_job_on_host.empty?
+    not_existing_task_statuses_of_job_on_host.each do |t|
+      host_job_key = HostJobKey.new(t.cluster_name, t.host_name, t.job_id)
+      # Diff and not directly set to 0 because we want to reduce from the task 
+      # counters of the cluster and host, that might have way more tasks on this
+      # state from other jobs
+      diff = 0 - get_tasks_count(host_job_key, t.task_status)
+      set_tasks_count(host_job_key, t.task_status, 0)
+      @clusters[t.cluster_name].task_status_update_signal(t.host_name, t.job_id, t.task_status, diff)
+    end
+  end
+
+  def set_tasks_count(key, task_status, task_count)
+    fail RangeError, "Tasks cannot be less than zero! (Found: #{task_count})" unless task_count >= 0
+    @tasks_map[key] = TaskStatusCounters.new('world', key) unless @tasks_map.key?(key)
+    diff = task_count - @tasks_map[key].get_count_of_status(task_status)
+    @tasks_map[key].set_count_of_status(task_status, task_count)
+    diff
+  end
+
+  def get_tasks_count(key, task_status)
+    get_tasks_map_with_key(key).get_count_of_status(task_status)
+  end
+
+  def update_finished_jobs_on_cluster(finished_jobs_on_cluster)
+    # finished_jobs_on_cluster is a set of unique ClusterJobKeys <cluster_name, job_id>
+    return if finished_jobs_on_cluster.nil? || finished_jobs_on_cluster.size == 0
+    finished_jobs_on_cluster.each { |j| @clusters[j.cluster_name].job_finished_signal(j.job_id) }
+  end
+
+  def update_finished_jobs_on_host(finished_jobs_on_host)
+    # finished_jobs_on_host is a set of unique HostJobKeys <cluster_name, host_name, job_id>
+    return if finished_jobs_on_host.nil? || finished_jobs_on_host.size == 0
+
+    finished_jobs_on_host.each do |j|
+      host_job_key = HostJobKey.new(j.cluster_name, j.host_name, j.job_id)
+      job_on_host_task_status_counters = get_tasks_map_with_key(host_job_key)
+  
+      @clusters[j.cluster_name].job_done_on_host_signal(\
+                                                        @last_processed_timestamp,\
+                                                        j.job_id,\
+                                                        j.host_name,\
+                                                        job_on_host_task_status_counters)
+      job_on_host_task_status_counters.reset_counters # Reset world counters for this key
+    end
+  end
+
+  def update_finished_jobs(finished_jobs_on_cluster, finished_jobs_on_host)
+    update_finished_jobs_on_cluster(finished_jobs_on_cluster)
+    update_finished_jobs_on_host(finished_jobs_on_host)
+  end
+
+  # Mimics Altiscale datacenters behavior owning a number of clusters with host assigned to them 
+  # and also a number of inventory hosts. Scheduling shouldn't be done between different collocs 
+  # so it also servers as the logical separation for scheduling.
+  # Keeps track of the free/busy hosts and clusters running on capacity along with stats 
+  # related to their utilization
+  # Provides the interface to the scheduler so the scheduler can build its models by knowing at 
+  # each time what are the available free hosts and what are the clusters that utilize 
+  # all of their resources
+  class Colloc
+    attr_reader :full_clusters,
+      :inventory_hosts,
+      :free_hosts
+    attr_accessor :name,
+    :busy_hosts,
+    :clusters,
+    :avg_utilization,
+    :ticks
+      
+    def initialize(world, name)
+      @name = name
+      @free_hosts = Hash.new
+      @busy_hosts = Hash.new
+      @full_clusters = Hash.new
+      @clusters = Set.new
+      @total_utilization = 0.0
+      @ticks = 0 #The number of timestamps/minutes passed since colloc existance
+      world.register_colloc(self) ##Let the world know a new colloc exists!
+      @inventory_hosts = Hash.new
+      @inventory_hosts = create_inventory_hosts(world)
+      @moving_hosts = Hash.new
+      @logger = Logger.new(STDOUT)
+      @logger.level = Logger::ERROR
+    end
+
+    def update_stats(_timestamp)
+      return unless all_hosts_count > 0
+      @ticks += 1
+      @total_utilization += current_utilization
+      avg_utilization
+    end
+
+    def print_stats
+      puts "Hosts (free - busy - inventory): \
+      #{free_hosts_count} - #{busy_hosts_count} - #{inventory_hosts_count}"
+      puts "Utilization (current - avg): \
+      #{current_utilization} - #{avg_utilization} - Ticks: #{@ticks}"
+      # sleep 1
+    end
+
+    def avg_utilization
+      @total_utilization / @ticks
+    end
+
+    def current_utilization
+      (all_hosts_count > 0) ? busy_hosts_count.to_f / all_hosts_count : 'UNDEF'
+    end
+
+    def moving_from_inventory(host_names)
+      return if host_names.nil? || host_names.empty?
+      host_names.each do |host_name|
+        host = @inventory_hosts.delete(host_name)
+        host.in_transit_signal(Constants::HostStatus::MOVING)
+        @moving_hosts[host_name] = host
+      end
+    end
+    
+    def moving_to_inventory(host_names)
+      return if host_names.nil? || host_names.empty?
+      host_names.each do |host_name|
+        host = @free_hosts.delete(host_name)
+        host.in_transit_signal(Constants::HostStatus::MOVING)
+        fail MovingBusyHostError, "Moving a busy host" if host.nil?
+        @moving_hosts[host_name] = host
+      end
+    end
+    
+    def full_clusters_clone
+      @full_clusters.clone
+    end
+
+    def inventory_hosts_clone
+      @inventory_hosts.clone
+    end
+
+    def free_hosts_clone
+      @free_hosts.clone
+    end
+
+    def stdev_utilization
+      # TODO: Implement
+    end
+
+    def clusters_count
+      @clusters.size
+    end
+
+    def full_clusters_count
+      @full_clusters.size
+    end
+
+    def all_hosts_count
+      (free_hosts_count + busy_hosts_count)
+    end
+
+    def free_hosts_count
+      @free_hosts.size
+    end
+
+    def busy_hosts_count
+      @busy_hosts.size
+    end
+
+    def inventory_hosts_count
+      @inventory_hosts.size
+    end
+
+    def get_free_hosts
+      get_hosts(Constants::HostStatus::FREE)
+    end
+
+    def get_busy_hosts
+      get_hosts(Constants::HostStatus::BUSY)
+    end
+
+    def get_hosts(status)
+      if (status == Constants::HostStatus::FREE)
+        @free_hosts
+      elsif (status == Constants::HostStatus::BUSY)
+        @busy_hosts
+      elsif (status == Constants::HostStatus::INVENTORY)
+        @inventory_hosts
+      else
+        raise UnsupportedHostStatusError, "Host status unknown or unsupported!"
+      end
+    end
+
+    def cluster_status_changed_signal(cluster)
+      (cluster.full)? add_to_full_clusters(cluster) : remove_from_full_clusters(cluster)
+    end
+
+    def host_status_changed_signal(host_name, prev_status, current_status)
+      # Signal received from Host
+      @logger.debug "#{host_name} - #{prev_status} --> #{current_status}"
+      host = case prev_status
+
+             when Constants::HostStatus::FREE
+               @free_hosts[host_name]
+             when Constants::HostStatus::BUSY
+               @busy_hosts[host_name]
+             when Constants::HostStatus::INVENTORY
+               @inventory_hosts[host_name]
+             else
+               fail UnsupportedHostStatusError, 'Host status unknown or unsupported!'
+       end
+
+     host_status_updated(host, current_status)
+    end
+
+    def print_summary
+      puts "--> Colloc: #{name}"
+      puts "- Hosts: Busy(#{busy_hosts_count}) - Free(#{free_hosts_count})"
+    end
+
+    def print_all
+      print_summary
+      puts 'Free hosts:'
+      if @free_hosts.empty?
+        puts 'None!'
+      else
+        @free_hosts.each_key { |k| puts k }
+      end
+      puts 'Busy hosts:'
+      if @busy_hosts.empty?
+        puts 'None!'
+      else
+        @busy_hosts.each_key { |k| puts k }
+      end
+      puts
+      print_stats
+    end
+
+    def register_cluster(cluster)
+      add_to_clusters(cluster)
+      add_to_full_clusters(cluster) if cluster.full
+    end
+
+    def register_host(host)
+      case host.status
+      when Constants::HostStatus::INVENTORY
+        add_to_inventory_hosts(host)
+      when Constants::HostStatus::FREE
+        add_to_free_hosts(host)
+      else
+        add_to_busy_hosts(host)
+
+      end
+ 
+      if is_on_free_hosts(host) && is_on_busy_hosts(host)
+        fail InconsistentStateError, "Registered host #{host.name} in both free and busy sets!"
+      end
+    end
+
+    # Host is tightly coupled with colloc (its part of the hostname)
+    # No need to provide a deregister method
+
+    ################################
+
+    private # all methods that follow will be made private: not accessible for outside objects
+
+    def create_inventory_hosts(world)
+
+      (1..world.inventory_hosts_count).each do |seq|
+        host_name = 'inv' + seq.to_s + '.' + name + '.verticloud.com'
+        host = Host.new(world, self, host_name)
+        add_to_inventory_hosts(host)
+      end
+      @inventory_hosts
+    end
+
+    def host_status_updated(host, status)
+      case status
+      when Constants::HostStatus::INVENTORY
+        host_went_back_to_inventory(host)
+      when Constants::HostStatus::FREE
+        host_status_changed_to_free(host)
+      else
+        host_status_changed_to_busy(host)
+      end
+
+    end
+
+    def host_went_back_to_inventory(host)
+      add_to_inventory_hosts(host)
+      (is_on_free_hosts) ? remove_from_free_hosts(host) : remove_from_busy_hosts(host)
+    end
+
+    def host_status_changed_to_busy(host)
+      add_to_busy_hosts(host)
+      (is_on_free_hosts(host)) ? remove_from_free_hosts(host) : remove_from_inventory_hosts(host)
+    end
+
+    def host_status_changed_to_free(host)
+      add_to_free_hosts(host)
+      (is_on_busy_hosts(host)) ? remove_from_busy_hosts(host) : remove_from_inventory_hosts(host)
+    end
+
+    def add_to_clusters(cluster)
+      @clusters.add(cluster.name)
+    end
+
+    def add_to_full_clusters(cluster)
+      @full_clusters[cluster.name] = cluster
+    end
+
+    def remove_from_full_clusters(cluster)
+      @full_clusters.delete(cluster.name)
+    end
+
+    def add_to_inventory_hosts(host)
+      @inventory_hosts[host.name] = host
+    end
+
+    def remove_from_inventory_hosts(host)
+      @inventory_hosts.delete(host.name)
+    end
+
+    def add_to_free_hosts(host)
+      @free_hosts[host.name] = host
+    end
+
+    def remove_from_free_hosts(host)
+      @free_hosts.delete(host.name)
+    end
+
+    def add_to_busy_hosts(host)
+      @busy_hosts[host.name] = host
+    end
+
+    def remove_from_busy_hosts(host)
+      @busy_hosts.delete(host.name)
+    end
+
+    def is_on_free_hosts(host)
+      @free_hosts.include?(host.name)
+    end
+
+    def is_on_busy_hosts(host)
+      @busy_hosts.include?(host.name)
+    end
+  end
+
+  # Mimics YARN cluster behavior. Keeps track of the submitted jobs and their statuses, 
+  # waiting/ running tasks, and free/busy hosts.
+  class Cluster
+    # Either keep free/busy as sets containing only host_names or completely remove hosts hash
+    attr_accessor :name,
+                  :colloc_name, 
+                  :hosts,
+                  :jobs,
+                  :busy_hosts,
+                  :free_hosts,
+                  :task_status_counters,
+                  :full # true if free_hosts is empty and cluster has at least one waiting task
+    def initialize(world, name, colloc)
+      @name = name
+      @colloc = colloc
+      @hosts = Hash.new(0)
+      @free_hosts = Hash.new(0)
+      @busy_hosts = Hash.new(0)
+      @jobs = Hash.new(0)
+      @job_status_counters = JobStatusCounters.new(@name) # ex: <RUNNING, 10>, <WAITING, 20>...
+      @task_status_counters = TaskStatusCounters.new('cluster', @name)
+      @full = is_full?
+      world.register_cluster(self, colloc.name) # Let the world know a new cluster was born!
+      @logger = Logger.new(STDOUT)
+      @logger.level = Logger::INFO
+    end
+
+    def update(event, task_diff)
+      fail ArgumentError, "Event not targeting this cluster (Found: #{event.cluster_name} \
+      - Expecting: #{@name})" unless event.cluster_name == @name
+
+      # No need to register job to host. Job will be be added in running jobs of host on host.update
+      task_status = event.task_status
+      begin
+  # Add diff calculated for the status of this specific Job to the total count for 
+  # this status among all jobs on this cluster
+        @task_status_counters.add_value_to_status(task_status, task_diff)
+      rescue => e
+        @logger.error "Tasks on cluster cannot be less than zero! \
+  Found: #{@task_status_counters.get_count_of_status(task_status)} for cluster: #{@name}"
+        @logger.error 'Cluster object status:'
+        @logger.error "#{inspect}"
+        @logger.error e.message
+        e.backtrace.each { |line| @logger.error line }
+        @logger.error e.backtrace
+        raise
+      end
+
+     
+      # Need jobs counters and free/busy hosts to be updated? NO... 
+      # 1) job_status_counters are updated through job_status_changed_signal 
+      # 2) host status is updated with host_status_changed_signal
+
+      #send_cluster_status_changed_signal if cluster_status_changed?
+
+      # Sanity checks
+      
+=begin
+      if (!@full and @task_status_counters.waiting_count > 0)
+        @logger.warn "#{event.timestamp}: #{name} has #{@task_status_counters.waiting_count} \
+        waiting tasks but not full!"  
+        if @logger.warn 
+          puts "free:"
+          @free_hosts.each_key { |h| puts h}
+          puts "busy:"
+          @busy_hosts.each_key { |h| puts h}
+        end 
+        #fail InconsistentStateError, "Cluster has #{@task_status_counters.waiting_count} waiting tasks but not full!" 
+        end
+        
+=end
+    end
+
+    def register_job(job)
+      fail StandardError, "Job with id: #{job.id} already exists!" if has_job(job.id)
+      add_job(job)
+      @job_status_counters.increase_count_of_status(job.status)
+      # Job will be registered with host on cluster update
+    end
+
+    def events_processed_signal(timestamp)
+      send_cluster_status_changed_signal if cluster_status_changed?
+      
+      if busy_hosts_count > 0 && @job_status_counters.running_count == 0
+             @logger.error 'Busy Hosts:'
+             @busy_hosts.each_key { |k| puts k } if @logger.error?
+             @logger.error 'job counters'
+             @job_status_counters.print
+             @logger.error 'task counters'
+             @task_status_counters.print
+             fail InconsistentStateError, \
+       "Cluster #{@name} - timestamp: #{timestamp}: Busy hosts = #{busy_hosts_count} \
+       and running job status counters=#{@job_status_counters.running_count}"
+           end
+           
+      
+      if (@job_status_counters.running_count == 0 && busy_hosts_count > 0) \
+        || (@job_status_counters.running_count > 0 && busy_hosts_count == 0)
+          fail InconsistentStateError, "Cluster #{@name} - timestamp: #{timestamp}: Running job counters: #{@job_status_counters.running_count} \
+            but busy hosts count: #{busy_hosts_count}"
+        end
+        fail InconsistentStateError, 'No Free hosts or Busy hosts on cluster!' \
+          unless free_hosts_count > 0 || busy_hosts_count > 0
+                
+      if (!@full and @task_status_counters.waiting_count > 10)
+          @logger.warn " #{@timestamp} - #{@name} has #{@task_status_counters.waiting_count} \
+          waiting tasks but not full!"  
+          if @logger.warn 
+            puts "free:"
+            @free_hosts.each_key { |h| puts h}
+            puts "busy:"
+            @busy_hosts.each_key { |h| puts h}
+          end 
+          #fail InconsistentStateError, "Cluster has #{@task_status_counters.waiting_count} waiting tasks but not full!" 
+          end
+    end
+        
+    def host_status_changed_signal(host_name, prev_status, current_status)
+      # Signal received from Host
+      @logger.debug "#{host_name} - #{prev_status} --> #{current_status}"
+      host_status_updated(host_name, current_status)
+    end
+
+    def task_status_update_signal(host_name, job_id, task_status, diff)
+      @task_status_counters.add_value_to_status(task_status, diff)
+      send_cluster_status_changed_signal if cluster_status_changed?
+      @jobs[job_id].task_status_update_signal(task_status, diff)
+      @hosts[host_name].task_status_update_signal(task_status, diff)
+    end
+
+    def job_done_on_host_signal(timestamp, job_id, host_name, job_on_host_task_status_counters)
+      # Signal received from World
+      puts "#{timestamp}: #{job_id} done on #{host_name}!" if @logger.debug?
+      if @logger.debug?
+        puts job_on_host_task_status_counters.map.inspect
+      end
+      
+      update_task_status_counters(job_on_host_task_status_counters.map)
+
+      @jobs[job_id].done_on_host_signal(host_name, job_on_host_task_status_counters.map)
+
+      # Job not necessarily in running state on host. Host unaware of a job in "REQUESTED" state
+      @hosts[host_name].job_not_running_signal(timestamp, job_id, job_on_host_task_status_counters.map)
+    end
+
+    def job_finished_signal(job_id)
+      # Signal received from World
+      initial_value = @job_status_counters.get_count_of_status(Constants::JobStatus::FINISHED)
+
+      puts "#{job_id} finished!" if @logger.debug?
+      job = @jobs[job_id]
+      prev_status = job.status # Job status not updated yet - Cluster will trigger done_on_cluster_signal of job later
+      new_status = Constants::JobStatus::FINISHED
+      update_job_status_counters(prev_status, new_status)
+      update_task_status_counters(job.task_status_counters.map)
+      # end
+
+      @task_status_counters.reset_counters unless @job_status_counters.active_on_cluster_count > 0
+      send_cluster_status_changed_signal if cluster_status_changed?
+
+      job.done_on_cluster_signal # Send signal to affected job
+
+      final_value = @job_status_counters.get_count_of_status(Constants::JobStatus::FINISHED)
+      if(final_value != (initial_value + 1))
+        fail InconsistentStateError, "Expected: #{initial_value + 1} - Found: #{final_value}"
+      end
+      # No need to send signal to each host. Will be updated from job_not_running signals
+    end
+
+    def job_status_changed_signal(old_status, new_status)
+      # We deal with FINISHED jobs through job_finished_signal only!
+      return unless new_status != Constants::JobStatus::FINISHED
+      # Signal received from Job
+      update_job_status_counters(old_status, new_status)
+    end
+
+    def register_host(host)
+      if(host.status == Constants::HostStatus::INVENTORY)
+        # A host in inventory shouldn't be registered with a cluster
+  fail InconsistentStateError, "Host #{host.name} status is INVENTORY but tried to register with cluster #{name}"
+      end
+      (host.status == Constants::HostStatus::FREE) ? add_to_free_hosts(host) : add_to_busy_hosts(host)
+      @hosts[host.name] = host
+      send_cluster_status_changed_signal if cluster_status_changed?
+      if (is_on_free_hosts(host.name) && is_on_busy_hosts(host.name))
+        fail InconsistentStateError, "Registered host #{host.name} in both free and busy lists!"
+      end
+    end
+
+    def deregister_host(host_name)
+      begin
+        fail HostNotInCluster, "Host: #{host_name} doesn't exist on #{cluster_name}!" unless has_host(host_name)
+      end
+      is_on_free_hosts(host_name) ? remove_from_free_hosts(host_name) : remove_from_busy_hosts(host_name)
+      @hosts.delete(host_name)
+      send_cluster_status_changed_signal if cluster_status_changed?
+      fail InconsistentStateError, "Deleted host #{host_name} still in free list!" if @free_hosts.key?(host_name)
+      fail InconsistentStateError, "Deleted host #{host_name} still in busy list!" if @busy_hosts.key?(host_name)
+    end
+
+    def has_job(job_id)
+      @jobs.key?(job_id)
+    end
+
+    def get_job(job_id)
+      @jobs[job_id]
+    end
+
+    def waiting_tasks_count
+      @task_status_counters.waiting_count
+    end
+
+    def active_tasks_count
+      @task_status_counters.active_count
+    end
+
+    def print_task_status_counters
+      @task_status_counters.print
+    end
+
+    def waiting_jobs_count
+      @job_status_counters.waiting_count
+    end
+
+    def active_jobs_count
+      @job_status_counters.active_on_cluster_count
+    end
+
+    def running_jobs_count
+      @job_status_counters.running_count
+    end
+
+    def print_job_status_counters
+      @job_status_counters.print
+    end
+
+    def free_hosts_count
+      @free_hosts.size
+    end
+
+    def busy_hosts_count
+      @busy_hosts.size
+    end
+
+    def hosts_count
+      @hosts.size
+    end
+
+    def print_all
+      print(true, true, true, true)
+    end
+
+    def print_summary
+      print(false, false, false)
+    end
+
+    def print(host_stats_on = false, job_stats_on = false, task_stats_on = false, display_hosts = false)
+      status = (full) ? 'full' : 'has space'
+      puts "---> Cluster: #{name} - Status: #{status}"
+      puts "- Hosts: Busy(#{busy_hosts_count}) - Free(#{free_hosts_count})"
+      puts "- Tasks Waiting: #{waiting_tasks_count}"
+      if display_hosts
+        puts 'Busy Hosts:'
+        busy_hosts = get_busy_hosts_names
+        puts((busy_hosts.empty?) ? 'None!' : busy_hosts.join(','))
+        puts 'Free Hosts:'
+        free_hosts = get_free_hosts_names
+        puts((free_hosts.empty?) ? 'None!' : free_hosts.join(','))
+      end
+
+      print_hosts_stats if host_stats_on
+
+      puts "-- Jobs: Waiting(#{waiting_jobs_count}) - Active(#{active_jobs_count})"
+      print_job_status_counters if job_stats_on
+
+      puts "--- Tasks: Waiting(#{waiting_tasks_count}) - Active(#{active_tasks_count})"
+      print_task_status_counters if task_stats_on
+    end
+
+    def print_hosts_stats
+      puts "------------- Stats per Host for Cluster #{@name} -----------------------"
+      @hosts.each do |name, host|
+        puts "---> Host: #{name} - status: #{host.status}"
+        host.print_stats(false, false)
+      end
+    end
+
+    ################################
+
+    private # all methods that follow will be made private: not accessible for outside objects
+
+    def is_job_running_on_host(finished_job_task_status_counters)
+      finished_job_task_status_counters.active_count > 0
+    end
+
+    def update_task_status_counters(finished_job_task_status_counters_map)
+      done = @task_status_counters.get_count_of_status(Constants::TaskStatus::DONE)
+      finished_job_task_status_counters_map.each do |k, v|
+        if (k != Constants::TaskStatus::DONE)
+          done += v
+          @task_status_counters.add_value_to_status(k, -v)
+        end
+      end
+      @task_status_counters.set_count_of_status(Constants::TaskStatus::DONE, done)
+
+      #send_cluster_status_changed_signal if cluster_status_changed?
+    end
+
+    def update_job_status_counters(prev_status, new_status)
+      return unless prev_status != new_status
+      @logger.debug "#{@name}: Job status changed FROM: #{prev_status} TO: #{new_status}"
+      begin
+        @job_status_counters.update_counters(prev_status, new_status)
+      rescue => e
+        @logger.error e.message
+        e.backtrace.each { |line| @logger.error line }
+        raise
+      end
+    end
+
+    def host_status_updated(host_name, status)
+      case status
+      when Constants::HostStatus::FREE
+        host_status_changed_to_free(host_name)
+      when Constants::HostStatus::BUSY
+        host_status_changed_to_busy(host_name)
+      when Constants::HostStatus::INVENTORY
+        host_back_to_inventory(host_name)
+      else
+        fail UnsupportedHostStatusError, 'Host status unknown or unsupported!'
+      end
+
+      send_cluster_status_changed_signal if cluster_status_changed?
+    end
+
+    def host_back_to_inventory(host_name)
+      (is_on_free_hosts(host_name)) ? remove_from_free_hosts(host_name) : remove_from_busy_hosts(host_name)
+    end
+
+    def host_status_changed_to_busy(host_name)
+      @busy_hosts[host_name] = @free_hosts[host_name]
+      remove_from_free_hosts(host_name)
+    end
+
+    def host_status_changed_to_free(host_name)
+      @free_hosts[host_name] = @busy_hosts[host_name]
+      remove_from_busy_hosts(host_name)
+    end
+
+    def cluster_status_changed?
+      prev_status = @full
+      @full = is_full?
+      (@full != prev_status)
+    end
+
+    def is_full?
+      # Should be called only at the end of a timestamp, after all events are processed
+      # In between state on cluster is inconsistent
+      (free_hosts_count == 0 && waiting_tasks_count > 0)
+    end
+
+    def send_cluster_status_changed_signal
+      @colloc.cluster_status_changed_signal(self)
+    end
+
+    def is_on_free_hosts(host_name)
+      @free_hosts.key?(host_name)
+    end
+
+    def is_on_busy_hosts(host_name)
+      @busy_hosts.key?(host_name)
+    end
+
+    def is_on_registered_hosts(host_name)
+      @hosts.key?(host_name)
+    end
+
+    def add_job(job)
+      @jobs[job.id] = job
+    end
+
+    def add_to_free_hosts(host)
+      @free_hosts[host.name] = host
+    end
+
+    def remove_from_free_hosts(host_name)
+      @free_hosts.delete(host_name)
+    end
+
+    def add_to_busy_hosts(host)
+      @busy_hosts[host.name] = host
+    end
+
+    def remove_from_busy_hosts(host_name)
+      @busy_hosts.delete(host_name)
+    end
+
+    def get_host(host_name)
+      @hosts[host_name]
+    end
+
+    def has_host(host_name)
+      @hosts.key?(host_name)
+    end
+
+    def get_hosts(status)
+      if (status == Constants::HostStatus::FREE)
+        @free_hosts
+      else
+        @busy_hosts
+      end
+    end
+
+    def get_free_hosts_names
+      @free_hosts.keys
+    end
+
+    def get_busy_hosts_names
+      @busy_hosts.keys
+    end
+
+    def get_all_hosts_names
+      @hosts.keys
+    end
+  end
+
+  # Mimics YARNs host. Keeps track of the jobs/tasks running and their corresponding statuses
+  class Host
+
+    attr_accessor :name,
+                  :status,
+                  :last_processed_timestamp, # Last time object was accessed trough event or signal
+                  :cluster_name,
+                  :colloc_name,
+                  :jobs,
+                  :task_status_counters,
+                  :tasks_capacity, # TODO: Determine how many tasks per host
+                  :cluster_name,
+                  :cluster,
+                  :stats
+    def initialize(world, colloc, name)
+      @name = name
+      @colloc = colloc
+      @status = Constants::HostStatus::INVENTORY
+      @logger = Logger.new(STDOUT)
+      @logger.level = Logger::ERROR
+      world.register_host(self, colloc.name) # Let the world know a new host was added!
+    end
+
+    def configure(world, cluster, task_status)
+      @cluster = cluster
+      @cluster_name = cluster.name
+
+      # XXX: Every status changed including the initial change from inventory should better
+      # be handled through the stats_changed method
+      if (@status == Constants::HostStatus::INVENTORY)
+        prev_status = @status
+        if (task_status == Constants::TaskStatus::REQUESTED)
+          @status = Constants::HostStatus::FREE
+        else
+          @status = Constants::HostStatus::BUSY
+        end
+        
+        # Only the colloc should know about the status change. When host status is INVENTORY 
+        # it hasn't register with a cluster yet!
+        @colloc.host_status_changed_signal(@name, prev_status, @status)
+      end
+
+      world.update_host_registration(self, cluster.name)
+      @task_status_counters = TaskStatusCounters.new('host', @name)
+      @running_jobs = Set.new # Job has tasks in any status other than "REQUESTED" in past minute
+      @finished_jobs = Set.new # Job had ran on this host but its now done on the cluster
+      @last_processed_timestamp = world.last_processed_timestamp
+      @stats = HostStats.new(name, world.last_processed_timestamp, @status)
+    end
+
+    def update(event, task_diff, cluster)
+      if (event.host_name != @name) 
+        fail ArgumentError, "Event not targeting this Host (found: #{event.host_name} \
+      - expecting: #{@name})"
+      end
+
+      if(event.timestamp < @last_processed_timestamp)
+        fail MonotonicTimeIncreaseError, "Cannot go back in time! Signal time received: \
+        #{event.timestamp} - Last update: #{@last_processed_timestamp}"
+      end
+      @last_processed_timestamp = event.timestamp
+
+      @logger.debug "*** task_diff = #{task_diff}"
+
+      if (event.cluster_name != @cluster_name) then move_to_cluster(cluster) end # Host changed cluster!
+
+      # Ignore events on REQUESTED state - Host is not aware of them in reality.
+      if (event.task_status == Constants::TaskStatus::REQUESTED) then return end
+
+      # job_ids are unique for the lifetime of particular cluster.
+      add_job_to_running(event.job_id) unless is_running_job(event.job_id)
+
+      task_status = event.task_status
+      begin
+        @task_status_counters.add_value_to_status(task_status, task_diff)
+      rescue => e
+        @logger.error 'Tasks on host cannot be less than zero!'
+        @logger.error 'Host object status:'
+        @logger.error "#{inspect}"
+        @logger.error 'TaskCount BEFORE event:'
+        @logger.error @task_status_counters.get_owner
+        @task_status_counters.print
+        @logger.error e.backtrace
+        raise
+      end
+
+      # Updating host status and sending signal to cluster
+      prev_status = @status
+      update_status
+      @logger.debug "HostName #{name} - prev_status: #{prev_status}  - current_status: #{@status}"
+      @logger.debug 'Active jobs:'
+      @running_jobs.each { |k| puts k } if @logger.debug?
+      @logger.debug 'Finished jobs:'
+      if @logger.debug?
+        if @finished_jobs.empty?
+          puts 'None!'
+        else
+          @finished_jobs.each { |k| puts k }
+        end
+      end
+
+      @logger.debug "After update of job #{event.job_id} on host: #{name} of cluster: #{cluster_name}"
+      # @logger.debug @task_status_counters.get_owner
+      # @task_status_counters.print
+
+      print_stats(true, true) if @logger.debug?
+    end
+
+    def events_processed_signal(timestamp)
+      update_status
+    end
+    
+    def task_status_update_signal(task_status, diff)
+      return unless task_status != Constants::TaskStatus::REQUESTED
+      @task_status_counters.add_value_to_status(task_status, diff)
+    end
+
+    def in_transit_signal(status)
+      # Host is moved from/ to inventory
+      reset
+      @status = status
+    end
+    
+    def provisioned_signal
+    end
+    
+    def emmitted_signal
+      # TODO: Implement
+    end
+    
+    def job_not_running_signal(timestamp, job_id, job_on_host_task_status_counters_map)
+      # Received from Cluster
+      # This signal doesn't imply that job finished on this host forever. 
+      # New tasks of this job might be assigned to this host later
+      if (timestamp < @last_processed_timestamp)
+        fail MonotonicTimeIncreaseError, "Cannot go back in time! Signal time received: \
+  #{timestamp} - Last update: #{last_processed_timestamp}"
+      end
+      @last_processed_timestamp = timestamp
+
+      update_task_status_counters(job_on_host_task_status_counters_map)
+      remove_job_from_running(job_id) # Will also update host status after removing the job
+      # Job stopped running just on host not necessarily finished on cluster - 
+      # Appropriate signal will be send on the job from the cluster
+    end
+
+    def print_stats(task_stats_on = false, _force_update = false)
+      # Attention: Forcing updates leads to inconsistencies
+      # (force_update)? @stats.update_and_print(@last_processed_timestamp) : @stats.print
+      @stats.print
+      print_task_counters if task_stats_on
+    end
+
+    def get_updated_stats(timestamp)
+      @stats.update_stats(timestamp)
+      @stats
+    end
+
+    ################################
+
+    private # all methods that follow will be made private: not accessible for outside objects
+
+    def print_task_counters
+      @task_status_counters.print
+    end
+
+    def add_job_to_running(job_id)
+      fail ArgumentError, "Job with id: #{job_id} already running on #{@name}!" if is_running_job(job_id)
+      @logger.debug "INFO: #{job_id} running on #{@name}"
+      @running_jobs.add(job_id)
+      update_status
+    end
+
+    def remove_job_from_running(job_id)
+      delete_job(job_id)
+      update_status
+    end
+
+    def update_task_status_counters(done_job_on_host_task_status_counters_map)
+      # job_on_host_task_status_counters contains the counters of the finished job on this host
+      done = @task_status_counters.get_count_of_status(Constants::TaskStatus::DONE)
+      done_job_on_host_task_status_counters_map.each do |k, v|
+        if k != Constants::TaskStatus::DONE && k != Constants::TaskStatus::REQUESTED # Ignore requested status for host
+          done += v
+          @task_status_counters.add_value_to_status(k, -v) # Subtract each value from the counters of the finished job
+        end
+      end
+      @task_status_counters.set_count_of_status(Constants::TaskStatus::DONE, done)
+    end
+
+    def update_status
+      prev_status = @status
+      @status = (running_jobs_count > 0) ? Constants::HostStatus::BUSY : Constants::HostStatus::FREE
+      # Every time the status changes a signal is send to the cluster, colloc and stats
+      if (prev_status != @status)
+        # Design choice: If instead of sending a signal we pass the host object to the 
+        # interested resources (ex: cluster, colloc) so they can take action, then we should make 
+        # sure that their update is happening after host's update
+        @cluster.host_status_changed_signal(name, prev_status, @status)
+        @colloc.host_status_changed_signal(name, prev_status, @status)
+        # XXX: This makes runtime much higher
+        @stats.status_changed_update(@last_processed_timestamp, prev_status, @status)
+      end
+    end
+
+    def move_to_cluster(new_cluster)
+      # World object is taking care of de-registering host from its previous cluster and 
+      # registering to the new one - No need to update_status and send signals. 
+      # World will send the appropriate signals to clusters
+      @logger.info "Host removed from cluster: #{@cluster_name} and assigned to: #{new_cluster.name}!!!"
+      @cluster = new_cluster
+      @cluster_name = @cluster.name
+      reset
+    end
+
+    def reset
+      # Update other members
+      @task_status_counters.reset_counters unless @task_status_counters.nil?
+      @running_jobs = Set.new
+      @finished_jobs = Set.new
+      @status = Constants::HostStatus::FREE
+      @stats = HostStats.new(@name, @last_processed_timestamp, @status)
+    end
+    
+    def finished_jobs_count
+      @finished_jobs.size
+    end
+
+    def is_registered_job(job_id)
+      is_running_job(job_id) || is_finished_job(job_id)
+    end
+
+    def is_finished_job(job_id)
+      @finished_jobs.include?(job_id)
+    end
+
+    def running_jobs_count
+      @running_jobs.size
+    end
+
+    def is_running_job(job_id)
+      @running_jobs.include?(job_id)
+    end
+
+    def add_job_to_registered(job_id)
+      @running_jobs.add(job_id)
+    end
+
+    def delete_job(job_id)
+      @running_jobs.delete(job_id)
+      @finished_jobs.add(job_id)
+    end
+
+    class HostStats
+      attr_reader :host_name,
+                  :max_time_busy,
+                  :max_time_free,
+                  :min_time_busy,
+                  :min_time_free,
+                  :total_time_busy,
+                  :total_time_free,
+                  :busy_count,
+                  :free_count,
+                  :current_status,
+                  :last_status_change,
+                  :granularity
+      def initialize(host_name, timestamp, current_status)
+        @host_name = host_name
+        @max_time_busy = -1
+        @max_time_free = -1
+        @min_time_busy = -1
+        @min_time_free = -1
+        @avg_time_busy = -1
+        @avg_time_free = -1
+        @total_time_busy = 0
+        @past_busy_time = 0
+        @total_time_free = 0
+        @past_free_time = 0
+        @busy_count = 0
+        @free_count = 0
+  # Total number of times the host changed status including the ones on the same second 
+  # that we don't consider for stats updates
+        @transitions_count = 0
+        @current_status = current_status
+        @time_in_current_status = 0
+        @time_registered = timestamp
+        @last_status_change = @time_registered
+        @last_stats_refresh = -1
+        @granularity = Constants::Numeric::GRANULARITY
+        @logger = Logger.new(STDOUT)
+        @logger.level = Logger::INFO
+      end
+
+      def status_changed_update(current_timestamp, prev_status, current_status)
+        return unless prev_status != Constants::HostStatus::INVENTORY
+        throw InconsistentStateError, 'Host cannot be on the same status' unless prev_status != current_status
+        if @logger.debug? then "**Stats status changed FROM: #{prev_status} TO: #{current_status}" end
+        @transitions_count += 1
+        return unless @last_status_change < current_timestamp # If status is changing on the same timestamp there is no point updating the stats
+
+        (current_status == Constants::HostStatus::FREE) ? host_changed_from_busy_to_free(current_timestamp) : host_changed_from_free_to_busy(current_timestamp)
+        @current_status = current_status
+        print_all if @logger.debug?
+      end
+
+      def update_stats(timestamp)
+        update_stats_since_last_status_change(timestamp)
+        print_all if @logger.debug?
+      end
+
+      def update_and_print(timestamp)
+        # Stats are updated automatically every time host status is changed and host stays in the 
+  # new status for at least a minute. This method forces the update of the stats in order 
+  # to have the fresher values from the last time the host got on its current state.
+        update_stats(timestamp)
+        (@logger.debug?) ? print_all : print
+      end
+
+      def print_all
+        instance_variables.each { |k, _v| puts "#{k}: #{instance_variable_get(k)}" }
+      end
+
+      def print
+        puts('*Node active less than 1 min') unless @time_registered < (@last_stats_refresh - @granularity)
+        puts "Time free: (avg - min - max): (#{avg_time_free_to_s} - #{min_time_free_to_s} - #{max_time_free_to_s})"
+        puts "Time busy: (avg - min - max): (#{avg_time_busy_to_s} - #{min_time_busy_to_s} - #{max_time_busy_to_s})"
+        total_count = @free_count + @busy_count
+        @logger.debug "State transitions: (free - busy - total | skipped): (#{@free_count} \
+  - #{@busy_count} - #{total_count} | #{@transitions_count - total_count})"
+      end
+
+      private
+
+      # Called after a host status is changed - Can also be called independently to get stats 
+      # at any particular time. When called with a status change occurring the status on the 
+      # current timestamp is not taken into consideration. For example if a cluster is running 
+      # for timestamp 20 and timestamp 80 and the method is called on timestamp 80, the calculated 
+      # time in current status will be 60 and not 120
+      def update_stats_since_last_status_change(current_timestamp)
+        return unless @last_stats_refresh < current_timestamp
+        @last_stats_refresh = current_timestamp
+        elapsed_time = current_timestamp - @last_status_change
+        @time_in_current_status = elapsed_time
+        @logger.debug "#{current_timestamp} - time_in_current_status: #{@time_in_current_status} \
+  (#{@current_status}) - elapsed: #{elapsed_time} - last_change: #{last_status_change}"
+
+        # Averages shouldn't be updated before the status is changed to avoid inconsistencies. 
+  # Only time they get values is before any transition has happened
+        if (@current_status == Constants::HostStatus::FREE)
+          @max_time_free = (@time_in_current_status > @max_time_free) ? @time_in_current_status : @max_time_free
+          @min_time_free = @time_in_current_status unless @min_time_free > 0
+          @avg_time_free = (@avg_time_free > 0) ? @avg_time_free : @time_in_current_status
+          @total_time_free = @time_in_current_status + @past_free_time
+        else
+          @max_time_busy = (@time_in_current_status > @max_time_busy) ? @time_in_current_status : @max_time_busy
+          @min_time_busy = @time_in_current_status unless @min_time_busy > 0
+          @avg_time_busy = (@avg_time_busy > 0) ? @avg_time_busy : @time_in_current_status
+          @total_time_busy = @time_in_current_status + @past_busy_time
+        end
+      end
+
+      # OPTIMIZE: Make host_changed_from_x_to_y one function for both free and busy statuses
+      def host_changed_from_busy_to_free(current_timestamp)
+        # The time passed since to detect a finished job and update host status. 
+        # Its the beginning of the 2nd timestamp that the job is not detected in the logs.
+        detection_lag = @granularity 
+        
+        elapsed_time = current_timestamp - @last_status_change # includes detection lag
+        fail ArgumentError, 'Method called for status change on the same timestamp!' unless elapsed_time > 0
+        @busy_count += 1
+
+        status_changed_time = current_timestamp - detection_lag
+        update_stats_since_last_status_change(status_changed_time)
+        @last_status_change = status_changed_time
+        @avg_time_busy = @total_time_busy / @busy_count
+        busy_time = elapsed_time - detection_lag
+        if busy_time < @min_time_busy || @min_time_busy == -1 then @min_time_busy = busy_time end
+        @past_busy_time += busy_time
+      end
+
+      def host_changed_from_free_to_busy(current_timestamp)
+        detection_lag = @granularity
+        elapsed_time = current_timestamp - @last_status_change
+        fail ArgumentError, 'Method called for status change on the same timestamp!' unless elapsed_time > 0
+
+        @free_count += 1
+
+
+        status_changed_time = current_timestamp - detection_lag
+        update_stats_since_last_status_change(status_changed_time)
+        @last_status_change = status_changed_time
+        @avg_time_free = @total_time_free / @free_count
+        free_time = elapsed_time - detection_lag
+        if free_time < @min_time_free || @min_time_free == -1 then @min_time_free = free_time end
+        @past_free_time += free_time
+      end
+
+      def min_time_free_to_s
+        (@min_time_free == -1) ? '?' : @min_time_free
+      end
+
+      def min_time_busy_to_s
+        (@min_time_busy == -1) ? '?' : @min_time_busy
+      end
+
+      def max_time_free_to_s
+        (@max_time_free == -1) ? '?' : @max_time_free
+      end
+
+      def max_time_busy_to_s
+        (@max_time_busy == -1) ? '?' : @max_time_busy
+      end
+
+      def avg_time_busy_to_s
+        if (@avg_time_busy == -1)
+          s = '?'
+        elsif (@avg_time_busy == 0)
+          s = "<#{@granularity}"
+        else
+          s = @avg_time_busy
+        end
+
+        s
+      end
+
+      def avg_time_free_to_s
+        if (@avg_time_free == -1)
+          s = '?'
+        elsif (@avg_time_free == 0)
+          s = "<#{@granularity}"
+        else
+          s = @avg_time_free
+        end
+
+        s
+      end
+    end
+  end
+
+  # Mimics YARN job/application behavior. Each job belongs to a cluster, has a number of tasks on 
+  # different statuses and runs on a set of hosts. Whenever the running status of a job changed 
+  # (that is based on the number of tasks on an active or waiting state) the job will send a signal
+  # to the cluster it belongs to
+  class Job
+    attr_accessor :id,
+                  :status,
+                  :prev_status,
+                  :task_status_counters,
+                  :cluster_name,
+                  :used_host_names
+    def initialize(cluster, id, cluster_name)
+      @id = id
+      @cluster_name = cluster_name
+      @used_host_names = Set.new
+      @prev_status = Constants::JobStatus::UNDEFINED
+      @status = Constants::JobStatus::UNDEFINED
+      @task_status_counters = TaskStatusCounters.new('job', @id)
+      cluster.register_job(self) # Let the cluster know that a new job was created
+      @logger = Logger.new(STDOUT)
+      @logger.level = Logger::ERROR
+    end
+
+    def update(event, task_diff, cluster)
+      unless(event.job_id == @id)      
+      fail ArgumentError, "Event not targeting this job, cluster couple! (found: #{event.job_id}\
+      , #{event.cluster_name} - expecting: #{@id}, #{@cluster_name})"
+      end
+
+      @used_host_names.add(event.host_name) unless (event.task_status == Constants::TaskStatus::REQUESTED)
+
+      task_status = event.task_status
+      status_changed = task_status_updated(task_status, task_diff)
+      if status_changed
+        # event.print
+        cluster.job_status_changed_signal(@prev_status, @status)
+      end
+      # No need to send signal to the hosts running the job
+      # the hosts will register the job_id on their update method
+    end
+
+    def events_processed_signal(timestamp)
+      update_status
+    end
+    
+    def task_status_update_signal(task_status, diff)
+      @task_status_counters.add_value_to_status(task_status, diff)
+      # Don't call update_status. Status will be updated later on update method
+    end
+
+    def done_on_cluster_signal
+      # Signal received from Cluster
+      puts "Job #{id} received done_on_cluster_signal!" if @logger.debug?
+      return unless @status != Constants::JobStatus::FINISHED # Making sure we do the updates just once
+      @status = Constants::JobStatus::FINISHED
+      @task_status_counters.reset_counters
+      @used_host_names.clear
+
+    end
+
+    def done_on_host_signal(host_name, job_on_host_task_status_counters_map)
+      # Signal received from Cluster
+      return unless is_using_host(host_name) # Making sure we do the updates just once
+      stop_using_host(host_name)
+      update_task_status_counters(job_on_host_task_status_counters_map)
+      # task_status_containers and status will be updated on next event accordingly. 
+      # Shouldn't deal with it here!
+      # Corner case: What if there is no other updated for this job on input? 
+      # Then done_on_cluster_signal will be send on the next minute and task_status_counters 
+      # will be reset
+    end
+
+    ################################
+
+    private # all methods that follow will be made private: not accessible for outside objects
+
+    def task_status_updated(task_status, diff)
+      @task_status_counters.add_value_to_status(task_status, diff)
+      update_status
+    end
+
+    def update_task_status_counters(done_job_on_host_task_status_counters_map)
+      # job_on_host_task_status_counters contains the counters of the finished job on this host
+      done = @task_status_counters.get_count_of_status(Constants::TaskStatus::DONE)
+      done_job_on_host_task_status_counters_map.each do |k, v|
+        if (k != Constants::TaskStatus::DONE)
+          done += v
+          @task_status_counters.add_value_to_status(k, -v)
+        end
+      end
+      @task_status_counters.set_count_of_status(Constants::TaskStatus::DONE, done)
+    end
+
+    def stop_using_host(host_name)
+      @used_host_names.delete(host_name)
+    end
+
+    def is_using_host(host_name)
+      @used_host_names.include?(host_name)
+    end
+
+    def update_status
+      if @task_status_counters.active_count > 0
+        new_status = Constants::JobStatus::RUNNING
+      elsif @task_status_counters.waiting_count > 0
+        new_status = Constants::JobStatus::WAITING
+      elsif (@status != Constants::JobStatus::UNDEFINED)
+        # Don't update to finish because this conflicts with job_finished_signal that will be 
+  # received from cluster and is based on the prev_status of the job to update correctly the 
+  # counters. The cluster will also send the done_on_cluster_signal to the job so eventually 
+  # the job will be updated to FINISHED
+        new_status = Constants::JobStatus::FINISHED
+      else
+        new_status = Constants::JobStatus::UNDEFINED
+        @logger.warn "Job #{id} has UNDEFINED status!"
+      end
+
+      # FINISHED status will be treated with done_on_cluster signal received from cluster.
+      return false if (new_status == Constants::JobStatus::FINISHED)
+
+      @prev_status = @status
+      @status = new_status
+
+      unless @task_status_counters.get_count_of_status(@status) >= 0
+  fail RangeError, "Tasks of job cannot be less than zero! (Found: #{@task_status_counters.get_count_of_status(status)} - job: #{@id})" 
+      end
+      @prev_status != @status
+    end
+  end
+
+  # The key that distinguishes a job on a per cluster basis. Used to update the LRU caches.
+  class ClusterJobKey
+    attr_reader :cluster_name, :job_id
+    def initialize(cluster_name, job_id)
+      @cluster_name = cluster_name
+      @job_id = job_id
+    end
+
+    def eql?(another_key)
+      @cluster_name == another_key.cluster_name && @job_id == another_key.job_id
+    end
+
+    def hash
+      [@cluster_name, @job_id].hash
+    end
+  end
+
+  # The key that distinguishes a job on a per host basis. Used to update the LRU caches 
+  # AND to caclulate the task difference between the differen event updates of a particular 
+  # task status.
+  class HostJobKey
+    attr_reader :cluster_name, :host_name, :job_id
+    def initialize(cluster_name, host_name, job_id)
+      @cluster_name = cluster_name
+      @host_name = host_name
+      @job_id = job_id
+    end
+
+    def eql?(another_key)
+      @cluster_name == another_key.cluster_name && @host_name == another_key.host_name && @job_id == another_key.job_id
+    end
+
+    def hash
+      [@cluster_name, @host_name, @job_id].hash
+    end
+  end
+
+  # The key that distinguishes a task status on a per job and host basis. 
+  # Used to update the LRU caches.
+  class HostJobStatusKey
+    attr_reader :cluster_name, :host_name, :job_id, :task_status
+    def initialize(cluster_name, host_name, job_id, task_status)
+      @cluster_name = cluster_name
+      @host_name = host_name
+      @job_id = job_id
+      @task_status = task_status
+    end
+
+    def eql?(another_key)
+      @cluster_name == another_key.cluster_name && @host_name == another_key.host_name \
+        && @job_id == another_key.job_id && @task_status == another_key.task_status
+    end
+
+    def hash
+      [@cluster_name, @host_name, @job_id, @task_status].hash
+    end
+  end
+
+  # Tracking the number of jobs on each status. Used for sanity check, create stats and
+  # to update status of a cluster between free/busy depending on the number of running/waiting jobs
+  class JobStatusCounters
+    attr_reader :cluster_name,
+                :map
+    def initialize(cluster_name)
+      @cluster_name = cluster_name
+      @map = Hash.new(0)
+      @logger = Logger.new(STDOUT)
+      @logger.level = Logger::INFO
+    end
+
+    def print
+      puts "UNDEFINED: #{@map[Constants::JobStatus::UNDEFINED]}"
+      puts "WAITING: #{@map[Constants::JobStatus::WAITING]}"
+      puts "RUNNING: #{@map[Constants::JobStatus::RUNNING]}"
+      puts "FINISHED: #{@map[Constants::JobStatus::FINISHED]}"
+    end
+
+    def get_count_of_status(job_status)
+      @map[job_status]
+    end
+
+    def set_count_of_status(job_status, count)
+      @logger.debug "status: #{job_status} of cluster: #{cluster_name} is set to #{count}. Caller: #{caller[0]}"
+      unless count >= 0
+  fail RangeError, "Job count cannot be less than zero! (found: #{count} for status: #{job_status} and cluster: #{@cluster_name}) - Caller: #{caller[0]}"
+      end
+      @map[job_status] = count
+    end
+
+    def update_counters(old_status, new_status)
+      return unless old_status != new_status
+      # NOTE: The following sanity check works for almost all cases but there is a chance that 
+      # a resource manager re-attempts a job with the same job-id but there is not info to 
+      # distinguish this case in the current dogfood database.
+      # unless (old_status != Constants::JobStatus::FINISHED)
+      #   raise ArgumentError, "Job status counters can't go back from #{old_status} status to #{new_status} - cluster: #{cluster_name}"
+      # end
+
+      begin
+        decrease_count_of_status(old_status)
+        increase_count_of_status(new_status)
+      rescue => e
+        @logger.error e.message
+        e.backtrace.each { |line| @logger.error line }
+        raise
+      end
+    end
+
+    def increase_count_of_status(job_status)
+      add_value_to_status(job_status, 1)
+    rescue => e
+      @logger.error e.message
+      e.backtrace.each { |line| @logger.error line }
+      raise
+    end
+
+    def decrease_count_of_status(job_status)
+      add_value_to_status(job_status, -1)
+    rescue => e
+      @logger.error e.message
+      e.backtrace.each { |line| @logger.error line }
+      raise
+    end
+
+    # When on waiting status the job is known to the cluster but not on the cluster hosts
+    def active_on_cluster_count
+      (waiting_count + running_count)
+    end
+
+    def waiting_count
+      @map[Constants::JobStatus::WAITING]
+    end
+
+    def running_count
+      @map[Constants::JobStatus::RUNNING]
+    end
+
+    private
+
+    def add_value_to_status(job_status, value)
+      set_count_of_status(job_status, (get_count_of_status(job_status) + value))
+    rescue => e
+      @logger.error e.message
+      e.backtrace.each { |line| @logger.error line }
+      @logger.error print
+      @logger.error "status: #{job_status} - count: #{get_count_of_status(job_status)} - adding: #{value}"
+      raise
+    end
+  end
+
+  # Tracking the number of tasks on each status. Clusters, Hosts and Jobs contain 
+  # TaskStatusCounters and determine their statuses (free, busy etc) and the transitions 
+  # between statuses from these counters
+  class TaskStatusCounters
+    attr_reader :owner_type,
+                :owner_id,
+                :map
+    def initialize(owner_type, owner_id)
+      @owner_type = owner_type
+      @owner_id = owner_id
+      @map = Hash.new(0)
+      @logger = Logger.new(STDOUT)
+      @logger.level = Logger::ERROR
+    end
+
+    def print
+      puts "REQUESTED: #{@map[Constants::TaskStatus::REQUESTED]}"
+      puts "RESERVED: #{@map[Constants::TaskStatus::RESERVED]}"
+      puts "ALLOCATED: #{@map[Constants::TaskStatus::ALLOCATED]}"
+      puts "ACQUIRED: #{@map[Constants::TaskStatus::ACQUIRED]}"
+      puts "RUNNING: #{@map[Constants::TaskStatus::RUNNING]}"
+      puts "EXPIRED: #{@map[Constants::TaskStatus::EXPIRED]}"
+      puts "DONE: #{@map[Constants::TaskStatus::DONE]}"
+    end
+
+    def reset_counters
+      # OPTIMIZE: Done state not necessary for calculations - just keeping stats. consider removing.
+      @logger.debug "Resetting task counters of type: #{@owner_type} with id #{@owner_id}!!!"
+      done = @map[Constants::TaskStatus::DONE]
+      @map.each do |k, v|
+        if k != Constants::TaskStatus::DONE && k != Constants::TaskStatus::REQUESTED
+          done += v
+        end
+      end
+      @map[Constants::TaskStatus::REQUESTED] = 0
+      @map[Constants::TaskStatus::RESERVED] = 0
+      @map[Constants::TaskStatus::ALLOCATED] = 0
+      @map[Constants::TaskStatus::ACQUIRED] = 0
+      @map[Constants::TaskStatus::RUNNING] = 0
+      @map[Constants::TaskStatus::EXPIRED] = 0
+      @map[Constants::TaskStatus::DONE] = done
+    end
+
+    def get_owner
+      @owner_id
+    end
+
+    def get_count_of_status(task_status)
+      @map[task_status]
+    end
+
+    def set_count_of_status(task_status, count)
+      unless count >= 0    
+        fail RangeError, "Task count cannot be less than zero! (Found: #{count} for status:\
+  #{task_status} - Owner type: #{@owner_type} with ID: #{@owner_id})"
+      end
+      @map[task_status] = count
+    end
+
+    def add_value_to_status(task_status, value)
+      @logger.debug "Caller: #{caller[0]}"
+      @logger.debug "Adding #{value} to status: #{task_status} of #{owner_type} task counters with id: #{owner_id}"
+      @logger.debug "Previous value: #{get_count_of_status(task_status)}"
+      set_count_of_status(task_status, (get_count_of_status(task_status) + value))
+      @logger.debug "Result: #{get_count_of_status(task_status)}"
+    rescue => e
+      @logger.error "Adding #{value} to status: #{task_status} of #{owner_type} task counters with id: #{owner_id}"
+      @logger.error e.message
+      e.backtrace.each { |line| @logger.error line }
+      raise
+    end
+
+    # The events on the input file with status "REQUESTED" are already filtered to be the ones being in REQUESTED state for more than 10 seconds
+    def waiting_count
+      @map[Constants::TaskStatus::REQUESTED]
+    end
+
+    def active_count
+      @map[Constants::TaskStatus::RESERVED] + @map[Constants::TaskStatus::ALLOCATED] \
+        + @map[Constants::TaskStatus::ACQUIRED] + @map[Constants::TaskStatus::RUNNING]
+    end
+  end
+end
