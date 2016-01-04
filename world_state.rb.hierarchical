@@ -1,0 +1,296 @@
+require 'set'
+
+require_relative 'input_log_event'
+require_relative 'state_updater'
+
+#OPTIMIZE: Put world and worldstate to different files
+
+class WorldState
+  attr_accessor :timestamp,
+                :world
+                
+  def initialize ()
+    @timestamp = Time.now.to_i
+    @world = World.new
+  end
+
+end
+
+class World
+
+  #TODO: Each initializer of the world components (clusters, hosts, collocs) should call a World method to be added on the map
+  #OPTIMIZE: Could instead be a hash<resource_type, resource_set> and each add/remove could be update_cluster(resource, action) instead of separate add_xx remove_xxx methods
+  attr_accessor :clusters_map,
+                :hosts_map,
+                :collocs_map,
+                :running_containers_count,
+                :waiting_containers_count
+                
+  def initialize
+    @clusters_map = Hash.new
+    @collocs_map = Hash.new
+    @hosts_map = Hash.new
+  end
+
+  #OPTIMIZE: Make one add(resource_type, resource) and remove(resource_type, resource)
+  def add_cluster(cluster)
+    @clusters_map[cluster.cluster_name] = cluster
+  end
+
+  def remove_cluster(cluster)
+    @clusters_map.delete(cluster.cluster_name)
+  end
+  
+  def clusters_count()
+    @clusters_map.size
+  end
+  
+  def add_colloc(colloc)
+    @collocs_map[colloc.name] = colloc
+  end
+
+  def remove_colloc(colloc)
+    @collocs_map.delete(colloc.name)
+  end
+  
+  def collocs_count()
+    @collocs_map.size
+    end 
+
+  def add_host(host)
+    @hosts_map[host.name] = host
+  end
+
+  def remove_host(host)
+    @hosts_map.delete[host.name]
+  end
+  
+  def hosts_count()
+   @hosts_map.size
+   end
+
+  def increase_running_containers (count)
+    @running_containers_count += count
+  end
+
+  def decrease_running_containers (count)
+    @running_containers_count -= count
+  end
+
+  def increase_waiting_containers (count)
+    @waiting_containers_count += count
+  end
+
+  def decrease_waiting_containers (count)
+    @waiting_containers_count -= count
+  end
+
+  def update(cluster_name, job_id, host_name, colloc_name, container_status, container_count)
+    
+        colloc, cluster, host = get_affected_resources(colloc_name, cluster_name, host_name)  #Create objects if they don't already exist in the world
+        
+        colloc.update(host_name)
+        cluster.update(job_id, host_name, colloc_name, container_status, container_count)
+        host.update(cluster_name, job_id, colloc_name, container_status, container_count)
+        #job.update(cluster_name,host_name,host_colloc,container_status,container_count)
+        
+   end
+   
+   def get_affected_resources(colloc_name, cluster_name, host_name)
+     colloc = (collocs_map.has_key?colloc_name)? collocs_map[colloc_name] : Colloc.new(self, colloc_name)    
+     #TODO: Send notification to world observer when colloc created      
+     cluster = (clusters_map.has_key?cluster_name)? clusters_map[cluster_name] : Cluster.new(self, cluster_name)
+     #TODO: Add created cluster to clusters_map or send notification from job initializer to world observer
+     
+     host = (hosts_map.has_key?host_name)? hosts_map[host_name] : Host.new(self, host_name, HostState::UNDEFINED, colloc_name, host_name)
+     #TODO: Send notification to world observer when host created
+     
+     return colloc, cluster, host
+     #TODO: 1) add created job to cluster map and 2)to world jobs_map or send notification from job initializer to cluster observer
+     #job = (cluster.jobs_map.has_key?job_id)? cluster.jobs_map[job_id] : Job.new(cluster_name, job_id)           
+  end
+   
+   
+   def update_host(host_name)
+     unless hosts_map.has_key?host_name   
+       hosts_map[host_name] =  Host.new(host_name, container_status)     
+       end
+         
+       hosts_map[host_name].update(job_id, host_name, host_colloc, container_status, container_count)              
+    end
+     
+=begin
+   def update_job(cluster_name,job_id)
+     unless (jobs_map.has_key?(job_id))   
+       jobs_map[job_id] =  Cluster.new(job_id)     
+     end
+     
+    jobs_map[job_id].update(host_name, host_colloc, container_status, container_count)
+           
+   end
+   
+=end
+   
+   
+
+  class Cluster
+    attr_accessor :cluster_name,
+                  :hosts_map,
+                  :jobs_map,
+                  :utilized_hosts_set,
+                  :free_hosts_set
+                  
+    def initialize (world, cluster_name)
+      @cluster_name = cluster_name
+      @hosts_map = Hash.new
+      @jobs_map = Hash.new
+      @utilized_hosts_set = Set.new
+      @free_hosts_set = Set.new
+      world.add_cluster(self) #Let the world know a new cluster was born!
+    end
+
+    def update(job_id, host_name, host_colloc, container_status, container_count)
+      #unless (hosts_map.has_key?(host_name))
+        #hosts_map[host_name] = Host.
+        #end
+    end
+    def get_free_hosts_count
+      @free_hosts_set.size
+    end
+
+    def get_utilized_hosts_count
+      @utilized_hosts_set.size
+    end
+
+    def get_total_hosts_count
+      (@free_hosts_set.size + @utilized_hosts_set.size)
+    end
+
+    def addHost(host)
+      (host.state == HostState::FREE)? free_hosts_set.add(host) : utilized_hosts_set.add(host)
+    end
+
+    def removeHost(host)
+      utilized_hosts_set.include?(host)? utilized_hosts_set.remove(host) : utilized_hosts_set.remove(host)
+    end
+
+    #Requires that host state is already changed
+    def swapHost(host)
+      removeHost(host)
+      addHost(host)
+    end
+  end
+
+  class Host
+
+    attr_accessor :name,
+                  :state,
+                  :cluster_name,
+                  :colloc_name,
+                  :containers_map,
+                  :containers_capacity,
+                  :cluster_id
+    
+                  
+    def initialize (world, name, state, cluster_name, colloc_name)
+      @name = name
+      @state = state
+      @cluster_name = cluster_name
+      @colloc_name = colloc_name
+      @containers_map = {}
+      world.add_host(self)
+    end      
+        
+    def update(cluster_name, job_id, colloc_name, container_status, container_count)
+      #TODO: Implement
+    end
+    
+    def update_state
+      #TODO: What about other states?
+    end
+    
+    def set_host_state(state)
+      @state = state
+    end
+    
+    def update_containers_states(state, count)
+      containers_states_map
+    end
+    
+  end
+ 
+  class Colloc
+    attr_accessor :name
+    attr_accessor :hosts_set
+    
+    def initialize(world, name)
+      @name = name
+      @hosts_set = Set.new
+      world.add_colloc(self)
+      
+    end
+    
+    def update(hosts)
+      
+    end
+    
+    def addHost(host)
+     (host.state == HostState::FREE)? free_hosts_set.add(host) : utilized_hosts_set.add(host)
+    end
+    
+    def removeHost(host)
+      utilized_hosts_set.include?(host)? utilized_hosts_set.remove(host) : utilized_hosts_set.remove(host)
+    end
+      
+  end
+
+ 
+  class Job
+    attr_accessor :id,
+                  :job_state,
+                  :containersSet,
+                  :containers_count,
+                  :cluster_id
+                  
+   def initialize(cluster_id, id)
+     @cluster_id = cluster_id
+     @id = id
+   end
+
+  end
+
+
+  class HostState
+    UNDEFINED = 0
+    UNASSIGNED = 1 #Host on the inventory
+    OFFLINE = 2
+    USED = 3
+    FREE = 4
+    REQUESTED = 5
+    RESERVED = 6
+    ALLOCATED = 7
+
+  end
+
+  class ContainerState
+    REQUESTED = 1
+    RESERVED = 2
+    ALLOCATED = 3
+    ACQUIRED = 4
+    RUNNING = 5
+    EXPIRED = 6
+  end
+
+  class JobState
+    WAITING = 1
+    RUNNING = 2
+    FINISHED = 3
+  end
+
+  class Colloc
+    #The location of the datacenter
+    sc1 = 1
+    as1 = 2
+
+  end
+end
